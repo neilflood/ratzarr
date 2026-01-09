@@ -57,6 +57,7 @@ import sys
 import os
 import shutil
 import unittest
+from urllib.parse import urlparse
 
 import numpy
 import zarr
@@ -102,40 +103,26 @@ class RatZarr:
         """
         self.usingS3 = False
         self.filename = filename
-        if filename.lower().startswith('s3://'):
+        components = urlparse(filename)
+        self.usingS3 = (components.scheme == 's3')
+        if self.usingS3:
             self.store = zarr.storage.FsspecStore.from_url(filename)
-            self.usingS3 = True
         else:
             self.store = filename
         self.grpName = "RAT"
 
         # First a sanity check if the store already exists.
-        existsWithoutRAT = False
-        notExists = False
-        #  Note that we have to test for slightly different exceptions
-        # between local and S3, because zarr has inconsistent behaviour.
-        notExistExc = FileNotFoundError
-        if self.usingS3:
-            notExistExc = zarr.errors.GroupNotFoundError
+        exists = RatZarr.exists(filename)
+        isValid = RatZarr.isValidRatZarr(filename)
 
-        try:
-            zarr.open(store=self.store, mode='r')
-        except notExistExc:
-            notExists = True
-        if not notExists:
-            try:
-                zarr.open(store=self.store, path=self.grpName, mode='r')
-            except zarr.errors.GroupNotFoundError:
-                existsWithoutRAT = True
-
-        if existsWithoutRAT:
-            msg = f"Zarr '{filename}' exists, but has no RAT group"
-            raise RatZarrError(msg)
-        if notExists and readOnly:
+        if not exists and readOnly:
             msg = f"readOnly is True, but file '{filename}' does not exist"
             raise RatZarrError(msg)
-        if notExists and not create:
+        if not exists and not create:
             msg = f"File '{filename}' does not exist, but create is False"
+            raise RatZarrError(msg)
+        if exists and not isValid:
+            msg = f"Zarr '{filename}' exists, but has no RAT group"
             raise RatZarrError(msg)
 
         mode = "a"
@@ -404,6 +391,110 @@ class RatZarr:
         chunks = self.columnCache[colName].chunks
         return chunks[0]
 
+    @staticmethod
+    def exists(zarrfile):
+        """
+        Check if the given filename exists. Does not confirm if it is a
+        valid Zarr or RatZarr file.
+
+        Parameters
+        ----------
+          zarrfile : str
+            Full name of a possible zarr file (including 's3://' if required)
+
+        Returns
+        -------
+          exists : bool
+            True if the named file exists
+        """
+        components = urlparse(zarrfile)
+        isS3 = (components.scheme == 's3')
+        if isS3:
+            if boto3 is None:
+                raise RatZarrError('Using S3, but boto3 unavailable')
+
+            s3client = boto3.client('s3')
+            bucket = components.netloc
+            key = components.path
+            if key.startswith('/'):
+                key = key[1:]
+            response = s3client.list_objects(Bucket=bucket, Prefix=key)
+            contents = response.get('Contents')
+            fileExists = (contents is not None)
+        elif components.scheme == '':
+            path = components.path
+            fileExists = os.path.exists(path)
+        else:
+            raise RatZarrError(f"Unknown zarrfile spec '{zarrfile}'")
+        return fileExists
+
+    @staticmethod
+    def isValidRatZarr(zarrfile):
+        """
+        Check if the given filename is a valid RatZarr file
+
+        Parameters
+        ----------
+          zarrfile : str
+            Full name of a possible zarr file (including 's3://' if required)
+
+        Returns
+        -------
+          isValid : bool
+            True if the named file exists and is valid RatZarr
+        """
+        valid = RatZarr.exists(zarrfile)
+        if valid:
+            isZarr = RatZarr.exists(os.path.join(zarrfile, 'zarr.json'))
+            isRatZarr = RatZarr.exists(os.path.join(zarrfile, 'RAT'))
+            valid = (isZarr and isRatZarr)
+        return valid
+
+    @staticmethod
+    def delete(zarrfile):
+        """
+        Delete the named RatZarr file.
+
+        Silently returns if file does not exists. Raises exception if
+        the file is not a valid RatZarr file.
+
+        Parameters
+        ----------
+          zarrfile : str
+            Full name of a possible zarr file (including 's3://' if required)
+        """
+        if not RatZarr.exists(zarrfile):
+            return
+        if not RatZarr.isValidRatZarr(zarrfile):
+            raise RatZarrError(f"{zarrfile} is not valid RatZarr")
+
+        components = urlparse(zarrfile)
+        isS3 = (components.scheme == 's3')
+        if isS3:
+            if boto3 is None:
+                raise RatZarrError('Using S3, but boto3 unavailable')
+
+            s3client = boto3.client('s3')
+            bucket = components.netloc
+            key = components.path
+            if key.startswith('/'):
+                key = key[1:]
+
+            response = s3client.list_objects(Bucket=bucket,
+                                             Prefix=key)
+            if 'Contents' in response:
+                objectKeyList = [o['Key'] for o in response['Contents']]
+                objSpec = {'Objects': [{'Key': k} for k in objectKeyList]}
+                s3client.delete_objects(Bucket=bucket,
+                                        Delete=objSpec)
+
+            # Wait until it is actually gone
+            while 'Contents' in response:
+                response = s3client.list_objects(Bucket=bucket,
+                                                 Prefix=key)
+        elif components.scheme == '':
+            shutil.rmtree(zarrfile)
+
 
 class RatZarrError(Exception):
     """
@@ -432,7 +523,7 @@ class AllTests(unittest.TestCase):
         "Test reading/writing/creating a simple RAT"
         fn = 'test1.zarr'
         fullFilename = self.makeFilename(fn)
-        self.deleteTestFile(fn)
+        self.deleteTestFile(fullFilename)
         rz = RatZarr(fullFilename)
         n = 100
         rz.setRowCount(n)
@@ -450,13 +541,13 @@ class AllTests(unittest.TestCase):
             numpy.testing.assert_array_equal(
                 col, trueCol, f'Column data mis-match (dtype={block.dtype})')
 
-        self.deleteTestFile(fn)
+        self.deleteTestFile(fullFilename)
 
     def test_flags(self):
         "Test a bunch of exception conditions on constructor flags"
-        fn = 'test1.zarr'
+        fn = 'test2.zarr'
         fullFilename = self.makeFilename(fn)
-        self.deleteTestFile(fn)
+        self.deleteTestFile(fullFilename)
 
         # readOnly with non-existent file
         with self.assertRaises(RatZarrError):
@@ -465,13 +556,13 @@ class AllTests(unittest.TestCase):
         with self.assertRaises(RatZarrError):
             _ = RatZarr(fullFilename, create=False)
 
-        self.deleteTestFile(fn)
+        self.deleteTestFile(fullFilename)
 
     def test_resize(self):
         "Reset rowCount"
-        fn = 'test1.zarr'
+        fn = 'test3.zarr'
         fullFilename = self.makeFilename(fn)
-        self.deleteTestFile(fn)
+        self.deleteTestFile(fullFilename)
 
         rz = RatZarr(fullFilename)
         n = 100
@@ -493,13 +584,13 @@ class AllTests(unittest.TestCase):
         col = rz.readBlock(colName, 0, n)
         self.assertEqual(col.shape[0], n, 'Increased rowCount mis-match')
 
-        self.deleteTestFile(fn)
+        self.deleteTestFile(fullFilename)
 
     def test_colnames(self):
         "Handling column names"
-        fn = 'test1.zarr'
+        fn = 'test4.zarr'
         fullFilename = self.makeFilename(fn)
-        self.deleteTestFile(fn)
+        self.deleteTestFile(fullFilename)
 
         rz = RatZarr(fullFilename)
         n = 100
@@ -519,13 +610,13 @@ class AllTests(unittest.TestCase):
         rz.deleteColumn(col1)
         self.assertFalse(rz.colExists(col1), f"Column '{col1}' not deleted")
 
-        self.deleteTestFile(fn)
+        self.deleteTestFile(fullFilename)
 
     def test_chunksize(self):
         "Chunk size manipulation"
-        fn = 'test1.zarr'
+        fn = 'test5.zarr'
         fullFilename = self.makeFilename(fn)
-        self.deleteTestFile(fn)
+        self.deleteTestFile(fullFilename)
 
         rz = RatZarr(fullFilename)
         rz.setRowCount(1000000)
@@ -549,7 +640,7 @@ class AllTests(unittest.TestCase):
         self.assertEqual(ratChunk, newChunk,
                          'Chunk size not preserved on disk')
 
-        self.deleteTestFile(fn)
+        self.deleteTestFile(fullFilename)
 
     def makeFilename(self, filename):
         """
@@ -569,23 +660,7 @@ class AllTests(unittest.TestCase):
         """
         Delete the given test file, if it exists
         """
-        if self.usingS3:
-            s3client = boto3.client('s3')
-            response = s3client.list_objects(Bucket=self.s3bucket,
-                                             Prefix=filename)
-            if 'Contents' in response:
-                objectKeyList = [o['Key'] for o in response['Contents']]
-                objSpec = {'Objects': [{'Key': k} for k in objectKeyList]}
-                s3client.delete_objects(Bucket=self.s3bucket,
-                                        Delete=objSpec)
-
-            # Wait until it is actually gone
-            while 'Contents' in response:
-                response = s3client.list_objects(Bucket=self.s3bucket,
-                                                 Prefix=filename)
-        else:
-            if os.path.exists(filename):
-                shutil.rmtree(filename)
+        RatZarr.delete(filename)
 
 
 def mainCmd():
